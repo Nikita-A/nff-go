@@ -30,6 +30,7 @@
 package flow
 
 import (
+	"net"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -56,9 +57,9 @@ type processSegment struct {
 // Flow is an abstraction for connecting flow functions with each other.
 // Flow shouldn't be understood in any way beyond this.
 type Flow struct {
-	current  low.Rings
-	segment  *processSegment
-	previous **Func
+	current       low.Rings
+	segment       *processSegment
+	previous      **Func
 	inIndexNumber int32
 }
 
@@ -139,9 +140,10 @@ type Kni struct {
 }
 
 type receiveParameters struct {
-	out  low.Rings
-	port *low.Port
-	kni  bool
+	out   low.Rings
+	port  *low.Port
+	kni   bool
+	stats common.RXTXStats
 }
 
 func addReceiver(portId uint16, kni bool, out low.Rings, inIndexNumber int32) {
@@ -149,10 +151,14 @@ func addReceiver(portId uint16, kni bool, out low.Rings, inIndexNumber int32) {
 	par.port = low.GetPort(portId)
 	par.out = out
 	par.kni = kni
+	var name string
 	if kni {
-		schedState.addFF("KNI receiver", nil, recvKNI, nil, par, nil, sendReceiveKNI, 0)
+		name = schedState.addFF("KNI receiver", nil, recvKNI, nil, par, nil, sendReceiveKNI, 0)
 	} else {
-		schedState.addFF("receiver", nil, recvRSS, nil, par, nil, receiveRSS, inIndexNumber)
+		name = schedState.addFF("receiver", nil, recvRSS, nil, par, nil, receiveRSS, inIndexNumber)
+	}
+	if countersSupported {
+		registerRXTXStatitics(&par.stats, name)
 	}
 }
 
@@ -190,6 +196,7 @@ type sendParameters struct {
 	in    low.Rings
 	queue int16
 	port  uint16
+	stats common.RXTXStats
 }
 
 func addSender(port uint16, queue int16, in low.Rings, inIndexNumber int32) {
@@ -197,10 +204,14 @@ func addSender(port uint16, queue int16, in low.Rings, inIndexNumber int32) {
 	par.port = port
 	par.queue = queue
 	par.in = in
+	var name string
 	if queue != -1 {
-		schedState.addFF("sender", nil, send, nil, par, nil, sendReceiveKNI, inIndexNumber)
+		name = schedState.addFF("sender", nil, send, nil, par, nil, sendReceiveKNI, inIndexNumber)
 	} else {
-		schedState.addFF("KNI sender", nil, send, nil, par, nil, sendReceiveKNI, inIndexNumber)
+		name = schedState.addFF("KNI sender", nil, send, nil, par, nil, sendReceiveKNI, inIndexNumber)
+	}
+	if countersSupported {
+		registerRXTXStatitics(&par.stats, name)
 	}
 }
 
@@ -361,7 +372,20 @@ type port struct {
 	willKNI        bool // will this port has assigned KNI device
 	port           uint16
 	MAC            [common.EtherAddrLen]uint8
-	InIndex     int32
+	InIndex        int32
+}
+
+type StatisticFlags struct {
+	// When true gather statistics related to IP protocol.
+	AnalyzeL3 bool
+	// When true gather statistics related to UDP protocol.
+	AnalyzeUDP bool
+	// When true gather statistics related to TCP protocol.
+	AnalyzeTCP bool
+	// When true gather statistics related to ICMP protocol.
+	AnalyzeICMP bool
+	// When true gather telemetry on each node in flow graph.
+	AnalyzeTelemetry bool
 }
 
 // Config is a struct with all parameters, which user can pass to NFF-GO library
@@ -417,6 +441,28 @@ type Config struct {
 	// Scheduler should clone functions even if ti can lead to reordering.
 	// This option should be switch off for all high level reassembling like TCP or HTTP
 	RestrictedCloning bool
+	// HTTP server address to use for serving statistics and
+	// telemetry. Server provides different types of statistics which
+	// can be controlled by statistics flags. File format is
+	// JSON. Registered roots return statistics for all framework
+	// graph nodes or accept an optional argument /ID where ID is port
+	// number for send and receive nodes.
+	//
+	// Following are possible statistics requests:
+	//
+	// /rxtxstats for protocol statistics gathered on all send and
+	// receive or /rxtxstats/name for individual send/receiver node.
+	//
+	// /telemetry for all nodes names and their counters which include
+	// received, send, processed, lost and dropped packets. Using
+	// /telemetry/name returns information about individual node.
+	//
+	// If no string is specified, no HTTP server is spawned.
+	StatsHTTPAddress *net.TCPAddr
+	// StatisticFlags specifies which types of statistics the
+	// framework should gather and serve using HTTP server running on
+	// StatsHTTPAddress.
+	StatisticFlags StatisticFlags
 }
 
 // SystemInit is initialization of system. This function should be always called before graph construction.
@@ -519,11 +565,23 @@ func SystemInit(args *Config) error {
 	portPair = make(map[uint32](*port))
 	// Init scheduler
 	common.LogTitle(common.Initialization, "------------***------ Initializing scheduler -----***------------")
-	StopRing := low.CreateRings(burstSize * sizeMultiplier, 50 /*Maximum possible rings*/)
+	StopRing := low.CreateRings(burstSize*sizeMultiplier, 50 /*Maximum possible rings*/)
 	common.LogDebug(common.Initialization, "Scheduler can use cores:", cpus)
 	schedState = newScheduler(cpus, schedulerOff, schedulerOffRemove, stopDedicatedCore, StopRing, checkTime, debugTime, maxPacketsToClone, maxRecv, anyway)
-	// Init packet processing
+
+	// Set HW offloading flag in packet package
 	packet.SetHWTXChecksumFlag(hwtxchecksum)
+
+	// Initialize telemetry web server
+	if countersSupported {
+		if args.StatsHTTPAddress != nil {
+			if err = initCounters(args.StatsHTTPAddress); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Init packet processing
 	for i := 0; i < 10; i++ {
 		for j := 0; j < burstSize; j++ {
 			vEach[i][j] = uint8(i)
@@ -602,7 +660,7 @@ func SetSenderFile(IN *Flow, filename string) error {
 // file is read infinitely in circle.
 // Returns new opened flow with read packets.
 func SetReceiverFile(filename string, repcount int32) (OUT *Flow) {
-	rings := low.CreateRings(burstSize * sizeMultiplier, 1)
+	rings := low.CreateRings(burstSize*sizeMultiplier, 1)
 	addReader(filename, rings, repcount)
 	return newFlow(rings, 1)
 }
@@ -620,7 +678,7 @@ func SetReceiver(portId uint16) (OUT *Flow, err error) {
 	}
 	createdPorts[portId].wasRequested = true
 	createdPorts[portId].willReceive = true
-	rings := low.CreateRings(burstSize * sizeMultiplier, createdPorts[portId].InIndex)
+	rings := low.CreateRings(burstSize*sizeMultiplier, createdPorts[portId].InIndex)
 	addReceiver(portId, false, rings, createdPorts[portId].InIndex)
 	return newFlow(rings, createdPorts[portId].InIndex), nil
 }
@@ -630,7 +688,7 @@ func SetReceiver(portId uint16) (OUT *Flow, err error) {
 // Receive queue will be added to port automatically.
 // Returns new opened flow with received packets
 func SetReceiverKNI(kni *Kni) (OUT *Flow) {
-	rings := low.CreateRings(burstSize * sizeMultiplier, 1)
+	rings := low.CreateRings(burstSize*sizeMultiplier, 1)
 	addReceiver(kni.portId, true, rings, 1)
 	return newFlow(rings, 1)
 }
@@ -640,7 +698,7 @@ func SetReceiverKNI(kni *Kni) (OUT *Flow) {
 // Returns new open flow with generated packets.
 // Function tries to achieve target speed by cloning.
 func SetFastGenerator(f GenerateFunction, targetSpeed uint64, context UserContext) (OUT *Flow, err error) {
-	rings := low.CreateRings(burstSize * sizeMultiplier, 1)
+	rings := low.CreateRings(burstSize*sizeMultiplier, 1)
 	if targetSpeed > 0 {
 		addFastGenerator(rings, f, nil, targetSpeed, context)
 	} else {
@@ -654,7 +712,7 @@ func SetFastGenerator(f GenerateFunction, targetSpeed uint64, context UserContex
 // Returns new open flow with generated packets.
 // Function tries to achieve target speed by cloning.
 func SetVectorFastGenerator(f VectorGenerateFunction, targetSpeed uint64, context UserContext) (OUT *Flow, err error) {
-	rings := low.CreateRings(burstSize * sizeMultiplier, 1)
+	rings := low.CreateRings(burstSize*sizeMultiplier, 1)
 	if targetSpeed > 0 {
 		addFastGenerator(rings, nil, f, targetSpeed, context)
 	} else {
@@ -669,7 +727,7 @@ func SetVectorFastGenerator(f VectorGenerateFunction, targetSpeed uint64, contex
 // Single packet non-clonable flow function will be added. It can be used for waiting of
 // input user packets.
 func SetGenerator(f GenerateFunction, context UserContext) (OUT *Flow) {
-	rings := low.CreateRings(burstSize * sizeMultiplier, 1)
+	rings := low.CreateRings(burstSize*sizeMultiplier, 1)
 	addGenerator(rings, f, context)
 	return newFlow(rings, 1)
 }
@@ -707,12 +765,12 @@ func SetCopier(IN *Flow) (OUT *Flow, err error) {
 	if err := checkFlow(IN); err != nil {
 		return nil, err
 	}
-	ringFirst := low.CreateRings(burstSize * sizeMultiplier, IN.inIndexNumber)
-	ringSecond := low.CreateRings(burstSize * sizeMultiplier, IN.inIndexNumber)
+	ringFirst := low.CreateRings(burstSize*sizeMultiplier, IN.inIndexNumber)
+	ringSecond := low.CreateRings(burstSize*sizeMultiplier, IN.inIndexNumber)
 	if IN.segment == nil {
 		addCopier(IN.current, ringFirst, ringSecond, IN.inIndexNumber)
 	} else {
-		tRing := low.CreateRings(burstSize * sizeMultiplier, IN.inIndexNumber)
+		tRing := low.CreateRings(burstSize*sizeMultiplier, IN.inIndexNumber)
 		ms := makeSlice(tRing, IN.segment)
 		segmentInsert(IN, ms, false, nil, 0, 0)
 		addCopier(tRing, ringFirst, ringSecond, IN.inIndexNumber)
@@ -880,7 +938,7 @@ func SetMerger(InArray ...*Flow) (OUT *Flow, err error) {
 			max = InArray[i].inIndexNumber
 		}
 	}
-	rings := low.CreateRings(burstSize * sizeMultiplier, max)
+	rings := low.CreateRings(burstSize*sizeMultiplier, max)
 	for i := range InArray {
 		if err := checkFlow(InArray[i]); err != nil {
 			return nil, err
@@ -936,7 +994,7 @@ func finishFlow(IN *Flow) low.Rings {
 		ring = IN.current
 		closeFlow(IN)
 	} else {
-		ring = low.CreateRings(burstSize * sizeMultiplier, IN.inIndexNumber)
+		ring = low.CreateRings(burstSize*sizeMultiplier, IN.inIndexNumber)
 		ms := makeSlice(ring, IN.segment)
 		segmentInsert(IN, ms, true, nil, 0, 0)
 	}
@@ -959,7 +1017,7 @@ func segmentInsert(IN *Flow, f *Func, willClose bool, context UserContext, setTy
 	} else {
 		if setType > 0 && IN.segment.stype > 0 && setType != IN.segment.stype {
 			// Try to combine scalar and vector code. Start new segment
-			ring := low.CreateRings(burstSize * sizeMultiplier, IN.inIndexNumber)
+			ring := low.CreateRings(burstSize*sizeMultiplier, IN.inIndexNumber)
 			ms := makeSlice(ring, IN.segment)
 			segmentInsert(IN, ms, false, nil, 0, 0)
 			IN.segment = nil
@@ -1106,12 +1164,12 @@ func segmentProcess(parameters interface{}, inIndex []int32, stopper [2]chan int
 
 func recvRSS(parameters interface{}, inIndex []int32, flag *int32, coreID int) {
 	srp := parameters.(*receiveParameters)
-	low.ReceiveRSS(uint16(srp.port.PortId), inIndex, srp.out, flag, coreID)
+	low.ReceiveRSS(uint16(srp.port.PortId), inIndex, srp.out, flag, coreID, &srp.stats)
 }
 
 func recvKNI(parameters interface{}, inIndex []int32, flag *int32, coreID int) {
 	srp := parameters.(*receiveParameters)
-	low.ReceiveKNI(uint16(srp.port.PortId), srp.out[0], flag, coreID)
+	low.ReceiveKNI(uint16(srp.port.PortId), srp.out[0], flag, coreID, &srp.stats)
 }
 
 func pGenerate(parameters interface{}, inIndex []int32, stopper [2]chan int, report chan reportPair, context []UserContext) {
@@ -1263,7 +1321,7 @@ func pcopy(parameters interface{}, inIndex []int32, stopper [2]chan int, report 
 
 func send(parameters interface{}, inIndex []int32, flag *int32, coreID int) {
 	srp := parameters.(*sendParameters)
-	low.Send(srp.port, srp.queue, srp.in, inIndex[0], flag, coreID)
+	low.Send(srp.port, srp.queue, srp.in, inIndex[0], flag, coreID, &srp.stats)
 }
 
 func merge(from low.Rings, to low.Rings) {
